@@ -1,0 +1,7 @@
+#ifndef RM_DA16600_CFG_H_
+#define RM_DA16600_CFG_H_
+#define DA16600_CFG_PARAM_CHECKING_ENABLED        ((BSP_CFG_PARAM_CHECKING_ENABLE))
+#define DA16600_CFG_CMD_TX_BUF_SIZE               (1500)
+#define DA16600_CFG_CMD_RX_BUF_SIZE               (3000)
+#define DA16600_CFG_RESET_PIN                     BSP_IO_PORT_07_PIN_08
+#endif /* RM_DA16600_CFG_H_ */
