@@ -4,7 +4,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 builder.Services.AddControllers();
-builder.Services.AddSingleton<StorageClient>(new StorageClient("DefaultEndpointsProtocol=https;AccountName=zmod4510-tables;AccountKey=7EbtCcUCaGyxAfElkAzA4HKIJzSUB80K02a287yvj7nYk05mlRnCJr1NaKluSpfeAcrSeUU0JwIdACDbTgdFoA==;TableEndpoint=https://zmod4510-tables.table.cosmos.azure.com:443/;"));
+builder.Services.AddSingleton<StorageClient>(new StorageClient("DefaultEndpointsProtocol=https;AccountName=zmod4510-tables;AccountKey=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX;TableEndpoint=https://zmod4510-tables.table.cosmos.azure.com:443/;"));
 
 var app = builder.Build();
 
