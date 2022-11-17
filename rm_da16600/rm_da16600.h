@@ -96,6 +96,9 @@ typedef enum e_da16600_event
     DA16600_EVENT_TCP_CLIENT_CONNECTED,
     DA16600_EVENT_TCP_CLIENT_DISCONNECTED,
     DA16600_EVENT_TCP_CLIENT_DATA_RECEIVED,
+	DA16600_EVENT_MQTT_CONNECTED,
+	DA16600_EVENT_MQTT_DISCONNECTED,
+	DA16600_EVENT_PUBLISH_REQUEST
 } da16600_event_t;
 
 typedef struct
@@ -198,6 +201,8 @@ da16600_err_t rm_da16600_factory_reset (void);
 da16600_err_t rm_da16600_restart (void);
 void rm_da16600_hw_reset (void);
 
+da16600_err_t rm_da16600_send_write_cmd(da16600_instance_ctrl_t* p_instance_ctrl, const uint8_t* p_textstring, uint32_t timeout_ms);
+
 /* Network commands */
 
 /* WiFi commands */
@@ -209,6 +214,13 @@ da16600_err_t rm_da16600_open_tcp_server_socket (uint16_t port);
 
 /* Data transfer commands */
 da16600_err_t rm_da16600_tcp_send (uint8_t * p_ipaddr, uint16_t port, uint8_t * p_data, uint32_t len);
+
+da16600_err_t rm_da16600_open_aziothub_mqtt_client(char* iotHubHostname, char* deviceName, char* sasToken);
+da16600_err_t rm_da16600_open_aziothub_mqtt_publish(char* message);
+
+da16600_err_t rm_da16600_http_client_post(char* url, char* data);
+
+da16600_err_t rm_da16600_get_time(char* timeBuffer, size_t timeBufferSize);
 
 /* Peripheral interrupt handlers */
 void rm_da16600_uart_callback (uart_callback_args_t *p_args);

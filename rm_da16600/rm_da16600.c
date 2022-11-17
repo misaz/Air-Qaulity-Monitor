@@ -33,6 +33,8 @@
 #include "rm_fifo.h"
 #include "rm_time.h"
 #include "rm_circ_buf.h"
+#include "SEGGER_RTT/SEGGER_RTT.h"
+#include "FreeRTOS.h"
 
 //#define DA16600_PRINTF_DEBUG_ENABLED
 
@@ -74,8 +76,8 @@
 
 /* Initial DA16600 module UART settings */
 #define DA16600_DEFAULT_BAUDRATE                 115200
-#define DA16600_DEFAULT_MODULATION               false
-#define DA16600_DEFAULT_ERROR                    9000
+#define DA16600_DEFAULT_MODULATION               true
+#define DA16600_DEFAULT_ERROR                    1000
 
 /* Maximum length of an AT command (including prefix and suffix) that can be transmitted */
 #define DA16600_COMMAND_LEN_MAX                  128
@@ -86,59 +88,49 @@
 /***********************************************************************************************************************
  * Private constants
  **********************************************************************************************************************/
-const uint8_t g_da16600_return_text_ok[]          = DA16600_RETURN_TEXT_OK;
-const uint8_t g_da16600_return_text_error[]       = DA16600_RETURN_TEXT_ERROR;
+const uint8_t g_da16600_return_text_ok[] = DA16600_RETURN_TEXT_OK;
+const uint8_t g_da16600_return_text_error[] = DA16600_RETURN_TEXT_ERROR;
 
 /***********************************************************************************************************************
  * Enumerations
  **********************************************************************************************************************/
-typedef enum e_da16600_g_rx_state
-{
-    DA16600_RX_STATE_IDLE = 0,
-    DA16600_RX_STATE_PREFIX,
-    DA16600_RX_STATE_DATA,
-    DA16600_RX_STATE_SUFFIX,
+typedef enum e_da16600_g_rx_state {
+	DA16600_RX_STATE_IDLE = 0, DA16600_RX_STATE_PREFIX, DA16600_RX_STATE_DATA, DA16600_RX_STATE_SUFFIX,
 } da16600_g_rx_state_t;
 
 /***********************************************************************************************************************
  * Typedef definitions
  **********************************************************************************************************************/
-typedef void (* rm_da16600_rsp_handler_func_t)(uint8_t * p_buf);
+typedef void (* rm_da16600_rsp_handler_func_t)(uint8_t* p_buf);
 
-typedef struct
-{
-    char                        * p_rsp;
-    rm_da16600_rsp_handler_func_t handler;
+typedef struct {
+	char* p_rsp;
+	rm_da16600_rsp_handler_func_t handler;
 } rm_da16600_rsp_handler_t;
 
 /***********************************************************************************************************************
  * Private function prototypes
  **********************************************************************************************************************/
 static void rm_da16600_process_rxd_char(uint8_t ch);
-static void rm_da16600_process_rxd_message(uint8_t * p_buf);
-static da16600_err_t rm_da16600_send_write_cmd(da16600_instance_ctrl_t * p_instance_ctrl,
-                                               const uint8_t           * p_textstring,
-                                               uint32_t                  timeout_ms);
-static da16600_err_t rm_da16600_send_read_cmd(da16600_instance_ctrl_t *  p_instance_ctrl,
-                                              const uint8_t           *  p_textstring,
-                                              uint32_t                   timeout_ms,
-                                              uint8_t                 ** p_rsp_buf);
-static bool rm_da16600_is_str_ok(const char * s);
-static bool rm_da16600_is_str_err(const char * s);
-static bool rm_da16600_is_str_rsp(const char * s);
-static void rm_da16600_handle_init(uint8_t * p_buf);
-static void rm_da16600_handle_wfdap(uint8_t * p_buf);
-static void rm_da16600_handle_wfjap(uint8_t * p_buf);
-static void rm_da16600_handle_trcts(uint8_t * p_buf);
-static void rm_da16600_handle_trxts(uint8_t * p_buf);
-static void rm_da16600_handle_trdts(uint8_t * p_buf);
-static void rm_da16600_handle_data_chunk(uint8_t * p_buf);
-static char * rm_da16600_findnchr(const char *str, char chr, int occ);
+static void rm_da16600_process_rxd_message(uint8_t* p_buf);
+static da16600_err_t rm_da16600_send_read_cmd(da16600_instance_ctrl_t* p_instance_ctrl, const uint8_t* p_textstring, uint32_t timeout_ms, uint8_t** p_rsp_buf);
+static bool rm_da16600_is_str_ok(const char* s);
+static bool rm_da16600_is_str_err(const char* s);
+static bool rm_da16600_is_str_rsp(const char* s);
+static void rm_da16600_handle_init(uint8_t* p_buf);
+static void rm_da16600_handle_wfdap(uint8_t* p_buf);
+static void rm_da16600_handle_wfjap(uint8_t* p_buf);
+static void rm_da16600_handle_trcts(uint8_t* p_buf);
+static void rm_da16600_handle_trxts(uint8_t* p_buf);
+static void rm_da16600_handle_trdts(uint8_t* p_buf);
+static void rm_da16600_handle_nwmqcl(uint8_t* p_buf);
+static void rm_da16600_handle_data_chunk(uint8_t* p_buf);
+static char* rm_da16600_findnchr(const char* str, char chr, int occ);
 
 /***********************************************************************************************************************
  * Private global variables
  **********************************************************************************************************************/
-static da16600_instance_ctrl_t g_rm_da16600_instance;
+da16600_instance_ctrl_t g_rm_da16600_instance;
 static da16600_callback_args_t g_rm16600_callback_args;
 static da16600_g_rx_state_t g_rx_state;
 static char g_da16600_cmd_in_progress[DA16600_COMMAND_LEN_MAX];
@@ -147,19 +139,10 @@ static uint32_t g_rx_data_len = 0;
 static rm_circ_buf_t rx_circ_buf;
 static uint8_t uart_rx_buffer[1024];
 
-static const rm_da16600_rsp_handler_t rsp_handlers[] =
-{
-    { "+INIT",                 rm_da16600_handle_init  },
-    { "+WFJAP",                rm_da16600_handle_wfjap },
-    { "+WFDAP",                rm_da16600_handle_wfdap },
-    { "+TRCTS",                rm_da16600_handle_trcts },
-    { "+TRXTS",                rm_da16600_handle_trxts },
-    { "+TRDTS",                rm_da16600_handle_trdts },
-    { NULL,                    NULL                    },
-};
+static const rm_da16600_rsp_handler_t rsp_handlers[] = { { "+INIT", rm_da16600_handle_init }, { "+WFJAP", rm_da16600_handle_wfjap }, { "+WFDAP", rm_da16600_handle_wfdap }, { "+TRCTS",
+		rm_da16600_handle_trcts }, { "+TRXTS", rm_da16600_handle_trxts }, { "+TRDTS", rm_da16600_handle_trdts }, { "+NWMQCL", rm_da16600_handle_nwmqcl }, { NULL, NULL }, };
 
-static baud_setting_t g_baud_setting_115200 =
-{.brme = 0, .abcse = 0, .abcs = 0, .bgdm = 0, .brr = 0, .mddr = 0, };
+static baud_setting_t g_baud_setting_115200;
 
 #if (DA16600_DEBUG_STATS_ENABLED == 1)
 static volatile uint32_t g_rx_msg_count;
@@ -176,112 +159,103 @@ static volatile uint32_t g_tx_msg_count;
  *  @retval DA16600_SUCCESS          DA16600 successfully configured.
  *  @retval DA16600_UART_ERROR       Error occured when configuring/opening the UART.
  **********************************************************************************************************************/
-da16600_err_t rm_da16600_open (da16600_cfg_t const * const p_cfg)
-{
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
-    uart_instance_t         * p_uart = NULL;
-    da16600_err_t             err = DA16600_UART_ERROR;
+da16600_err_t rm_da16600_open(da16600_cfg_t const*const p_cfg) {
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+	uart_instance_t* p_uart = NULL;
+	da16600_err_t err = DA16600_UART_ERROR;
 
-    static sci_uart_extended_cfg_t   uart0_cfg_extended_115200;
-    static uart_cfg_t                uart0_cfg_115200;
+	static sci_uart_extended_cfg_t uart0_cfg_extended_115200;
+	static uart_cfg_t uart0_cfg_115200;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ASSERT(NULL != p_cfg);
     FSP_ERROR_RETURN(DA16600_OPEN != p_instance_ctrl->open, FSP_ERR_ALREADY_OPEN);
 #endif
 
-    /* Clear the control structure*/
-    memset(p_instance_ctrl, 0, sizeof(da16600_instance_ctrl_t));
+	/* Clear the control structure*/
+	memset(p_instance_ctrl, 0, sizeof(da16600_instance_ctrl_t));
 
-    /* Initialize queue containing (pointers to) buffers used to store received messages */
-    rm_fifo_init(&p_instance_ctrl->buf_queue, p_instance_ctrl->queue_buf, DA16600_CFG_RX_BUF_POOL_LEN);
-    for (int i = 0; i < DA16600_CFG_RX_BUF_POOL_LEN; i++)
-    {
-        /* Add (pointer to) buffer to queue */
-        uint8_t * p_buf = &p_instance_ctrl->buf_pool[i][0];
-        bool added = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_buf);
-        FSP_ASSERT(true == added);
-    }
+	/* Initialize queue containing (pointers to) buffers used to store received messages */
+	rm_fifo_init(&p_instance_ctrl->buf_queue, p_instance_ctrl->queue_buf, DA16600_CFG_RX_BUF_POOL_LEN);
+	for (int i = 0; i < DA16600_CFG_RX_BUF_POOL_LEN; i++) {
+		/* Add (pointer to) buffer to queue */
+		uint8_t* p_buf = &p_instance_ctrl->buf_pool[i][0];
+		bool added = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_buf);
+		FSP_ASSERT(true == added);
+	}
 
-    /* Initialize queue used to hold command responses */
-    rm_fifo_init(&p_instance_ctrl->rsp_queue, p_instance_ctrl->rsp_buf, DA16600_CFG_RX_BUF_POOL_LEN);
+	/* Initialize queue used to hold command responses */
+	rm_fifo_init(&p_instance_ctrl->rsp_queue, p_instance_ctrl->rsp_buf, DA16600_CFG_RX_BUF_POOL_LEN);
 
-    /* Update control structure from configuration values */
-    p_instance_ctrl->p_da16600_cfg   = p_cfg;
-    p_instance_ctrl->uart_instance   = (uart_instance_t *) p_cfg->uart_instance;
-    p_instance_ctrl->ioport_instance = (ioport_instance_t *) p_cfg->ioport_instance;
-    p_instance_ctrl->reset_pin       = p_cfg->reset_pin;
-    p_instance_ctrl->p_callback      = p_cfg->p_callback;
+	/* Update control structure from configuration values */
+	p_instance_ctrl->p_da16600_cfg = p_cfg;
+	p_instance_ctrl->uart_instance = (uart_instance_t*)p_cfg->uart_instance;
+	p_instance_ctrl->ioport_instance = (ioport_instance_t*)p_cfg->ioport_instance;
+	p_instance_ctrl->reset_pin = p_cfg->reset_pin;
+	p_instance_ctrl->p_callback = p_cfg->p_callback;
 
-    /* Enable timer used for generic timing routines */
-    rm_time_init();
+	/* Enable timer used for generic timing routines */
+	rm_time_init();
 
-    /* Reset receive character state machine */
-    g_rx_state = DA16600_RX_STATE_IDLE;
-    g_da16600_cmd_in_progress[0] = '\0';
+	/* Reset receive character state machine */
+	g_rx_state = DA16600_RX_STATE_IDLE;
+	g_da16600_cmd_in_progress[0] = '\0';
 
-    /* Create memory copy of uart extended configuration and then copy new configuration values in. */
-    memcpy((void *) &uart0_cfg_extended_115200,
-           (void *) p_instance_ctrl->uart_instance->p_cfg->p_extend,
-           sizeof(sci_uart_extended_cfg_t));
+	/* Create memory copy of uart extended configuration and then copy new configuration values in. */
+	memcpy((void*)&uart0_cfg_extended_115200, (void*)p_instance_ctrl->uart_instance->p_cfg->p_extend, sizeof(sci_uart_extended_cfg_t));
 
-    /* Create memory copy of uart configuration and update with new extended configuration structure. */
-    memcpy((void *) &uart0_cfg_115200, p_instance_ctrl->uart_instance->p_cfg, sizeof(uart_cfg_t));
+	/* Create memory copy of uart configuration and update with new extended configuration structure. */
+	memcpy((void*)&uart0_cfg_115200, p_instance_ctrl->uart_instance->p_cfg, sizeof(uart_cfg_t));
 
-    R_SCI_UART_BaudCalculate(DA16600_DEFAULT_BAUDRATE,
-                             DA16600_DEFAULT_MODULATION,
-                             DA16600_DEFAULT_ERROR,
-                             &g_baud_setting_115200);
+	fsp_err_t fErr;
+	fErr = R_SCI_UART_BaudCalculate(DA16600_DEFAULT_BAUDRATE, DA16600_DEFAULT_MODULATION, DA16600_DEFAULT_ERROR, &g_baud_setting_115200);
+	if (fErr) {
+		__BKPT(0);
+	}
 
-    uart0_cfg_extended_115200.p_baud_setting   = &g_baud_setting_115200;
-    uart0_cfg_extended_115200.flow_control     = SCI_UART_FLOW_CONTROL_RTS;
-    uart0_cfg_extended_115200.flow_control_pin =
-        (bsp_io_port_pin_t) DA16600_BSP_PIN_PORT_INVALID;
+	uart0_cfg_extended_115200.p_baud_setting = &g_baud_setting_115200;
+	uart0_cfg_extended_115200.flow_control = SCI_UART_FLOW_CONTROL_RTS;
+	uart0_cfg_extended_115200.flow_control_pin = (bsp_io_port_pin_t) DA16600_BSP_PIN_PORT_INVALID;
 
-    uart0_cfg_115200.p_extend = (void *) &uart0_cfg_extended_115200;
+	uart0_cfg_115200.p_extend = (void*)&uart0_cfg_extended_115200;
 
-    /* Open uart with module default values for baud. 115200 and no hardware flow control. */
-    p_uart  = p_instance_ctrl->uart_instance;
-    fsp_err_t fsp_err = p_uart->p_api->open(p_uart->p_ctrl, &uart0_cfg_115200);
-    FSP_ASSERT(fsp_err == FSP_SUCCESS);
+	/* Open uart with module default values for baud. 115200 and no hardware flow control. */
+	p_uart = p_instance_ctrl->uart_instance;
+	fsp_err_t fsp_err = p_uart->p_api->open(p_uart->p_ctrl, &uart0_cfg_115200);
+	FSP_ASSERT(fsp_err == FSP_SUCCESS);
 
-    /* Simple ring/circular buffer is used to receive characters via the UART */
-    rm_circ_buf_init(&rx_circ_buf, &uart_rx_buffer[0], sizeof(uart_rx_buffer));
+	/* Simple ring/circular buffer is used to receive characters via the UART */
+	rm_circ_buf_init(&rx_circ_buf, &uart_rx_buffer[0], sizeof(uart_rx_buffer));
 
 #if (DA16600_DEBUG_STATS_ENABLED == 1)
-    g_rx_msg_count = 0;
-    g_tx_msg_count = 0;
+	g_rx_msg_count = 0;
+	g_tx_msg_count = 0;
 #endif
 
-    /* Put module into a known state */
-    rm_da16600_hw_reset();
+	/* Put module into a known state */
+	rm_da16600_hw_reset();
 
-    /* Test basic communications with an AT command, module takes time to reboot so try this a few times... */
-    uint8_t retries = 0;
-    do
-    {
-        err = rm_da16600_send_write_cmd(p_instance_ctrl, (uint8_t *)"AT\r\n", DA16600_TIMEOUT_500MS);
-    }
-    while ((retries++ < 10) && (err != DA16600_SUCCESS));
+	/* Test basic communications with an AT command, module takes time to reboot so try this a few times... */
+	uint8_t retries = 0;
+	do {
+		err = rm_da16600_send_write_cmd(p_instance_ctrl, (uint8_t*)"AT\r\n", DA16600_TIMEOUT_500MS);
+	} while ((retries++ < 10) && (err != DA16600_SUCCESS));
 
-    if (DA16600_SUCCESS == err)
-    {
-        p_instance_ctrl->open = DA16600_OPEN;
-    }
+	if (DA16600_SUCCESS == err) {
+		p_instance_ctrl->open = DA16600_OPEN;
+	}
 
-    return err;
+	return err;
 }
 
 /**********************************************************************************************************************
  *  Called periodically by application to process any characters received from the DA16600 module.
  **********************************************************************************************************************/
-void rm_da16600_task(void)
-{
-    uint8_t ch;
-    if (true == rm_circ_buf_get(&rx_circ_buf, &ch))
-    {
-        rm_da16600_process_rxd_char(ch);
-    }
+void rm_da16600_task(void) {
+	uint8_t ch;
+	if (true == rm_circ_buf_get(&rx_circ_buf, &ch)) {
+		rm_da16600_process_rxd_char(ch);
+	}
 }
 
 /**********************************************************************************************************************
@@ -289,48 +263,41 @@ void rm_da16600_task(void)
  *
  *  @param[in]  p_instance_ctrl       DA16600 instance.
  **********************************************************************************************************************/
-void rm_da16600_hw_reset (void)
-{
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+void rm_da16600_hw_reset(void) {
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
-    /* Reset the wifi module. */
-    p_instance_ctrl->ioport_instance->p_api->pinWrite(p_instance_ctrl->ioport_instance->p_ctrl,
-                                                      p_instance_ctrl->reset_pin, BSP_IO_LEVEL_LOW);
-    R_BSP_SoftwareDelay(500, BSP_DELAY_UNITS_MILLISECONDS);
-    p_instance_ctrl->ioport_instance->p_api->pinWrite(p_instance_ctrl->ioport_instance->p_ctrl,
-                                                      p_instance_ctrl->reset_pin, BSP_IO_LEVEL_HIGH);
-    R_BSP_SoftwareDelay(10, BSP_DELAY_UNITS_MILLISECONDS);
+	/* Reset the wifi module. */
+	p_instance_ctrl->ioport_instance->p_api->pinWrite(p_instance_ctrl->ioport_instance->p_ctrl, p_instance_ctrl->reset_pin, BSP_IO_LEVEL_LOW);
+	//R_BSP_SoftwareDelay(500, BSP_DELAY_UNITS_MILLISECONDS);
+	vTaskDelay(pdMS_TO_TICKS(500));
+	p_instance_ctrl->ioport_instance->p_api->pinWrite(p_instance_ctrl->ioport_instance->p_ctrl, p_instance_ctrl->reset_pin, BSP_IO_LEVEL_HIGH);
+	//R_BSP_SoftwareDelay(10, BSP_DELAY_UNITS_MILLISECONDS);
+	vTaskDelay(pdMS_TO_TICKS(10));
 }
-
 
 /**********************************************************************************************************************
  *  Send a TCP packet to a client.
  *
  *  @retval DA16600_SUCCESS          Packet transmitted successfully.
  **********************************************************************************************************************/
-da16600_err_t rm_da16600_tcp_send (uint8_t * p_ipaddr, uint16_t port, uint8_t * p_data, uint32_t len)
-{
-    da16600_err_t err;
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
-    uint8_t tx_buff[DA16600_CFG_TCP_TX_PKT_LEN_MAX];
+da16600_err_t rm_da16600_tcp_send(uint8_t* p_ipaddr, uint16_t port, uint8_t* p_data, uint32_t len) {
+	da16600_err_t err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+	uint8_t tx_buff[DA16600_CFG_TCP_TX_PKT_LEN_MAX];
 
-    uint32_t hdr_len = (uint32_t)sprintf((char *)tx_buff, "\eS0%d,%d.%d.%d.%d,%d,",
-                       (int)len, p_ipaddr[0], p_ipaddr[1], p_ipaddr[2], p_ipaddr[3], port);
-    if ((hdr_len + len) <= sizeof(tx_buff))
-    {
-        memcpy(&tx_buff[hdr_len], p_data, len);
+	uint32_t hdr_len = (uint32_t)sprintf((char*)tx_buff, "\eS0%d,%d.%d.%d.%d,%d,", (int)len, p_ipaddr[0], p_ipaddr[1], p_ipaddr[2], p_ipaddr[3], port);
+	if ((hdr_len + len) <= sizeof(tx_buff)) {
+		memcpy(&tx_buff[hdr_len], p_data, len);
 
-        /* Command needs to be NULL terminated */
-        tx_buff[hdr_len + len] = '\0';
+		/* Command needs to be NULL terminated */
+		tx_buff[hdr_len + len] = '\0';
 
-        err = rm_da16600_send_write_cmd(p_instance_ctrl, tx_buff, DA16600_TIMEOUT_500MS);
-    }
-    else
-    {
-        err = DA16600_INVALID_PARAM;
-    }
+		err = rm_da16600_send_write_cmd(p_instance_ctrl, tx_buff, DA16600_TIMEOUT_500MS);
+	} else {
+		err = DA16600_INVALID_PARAM;
+	}
 
-    return err;
+	return err;
 }
 
 /**********************************************************************************************************************
@@ -338,18 +305,17 @@ da16600_err_t rm_da16600_tcp_send (uint8_t * p_ipaddr, uint16_t port, uint8_t * 
  *
  *  @retval DA16600_SUCCESS          DA16600 successfully configured.
  **********************************************************************************************************************/
-da16600_err_t rm_da16600_factory_reset(void)
-{
-    da16600_err_t err;
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+da16600_err_t rm_da16600_factory_reset(void) {
+	da16600_err_t err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ERROR_RETURN(DA16600_OPEN == p_instance_ctrl->open, FSP_ERR_NOT_OPEN);
 #endif
 
-    err = rm_da16600_send_write_cmd(p_instance_ctrl, (uint8_t *)"ATF\r\n", DA16600_TIMEOUT_500MS);
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, (uint8_t*)"ATF\r\n", DA16600_TIMEOUT_500MS);
 
-    return err;
+	return err;
 }
 
 /**********************************************************************************************************************
@@ -357,14 +323,13 @@ da16600_err_t rm_da16600_factory_reset(void)
  *
  *  @retval DA16600_SUCCESS          DA16600 successfully configured.
  **********************************************************************************************************************/
-da16600_err_t rm_da16600_restart(void)
-{
-    da16600_err_t err;
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+da16600_err_t rm_da16600_restart(void) {
+	da16600_err_t err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
-    err = rm_da16600_send_write_cmd(p_instance_ctrl, (uint8_t *)"AT+RESTART\r\n", DA16600_TIMEOUT_500MS);
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, (uint8_t*)"AT+RESTART\r\n", DA16600_TIMEOUT_500MS);
 
-    return err;
+	return err;
 }
 
 /**********************************************************************************************************************
@@ -374,28 +339,24 @@ da16600_err_t rm_da16600_restart(void)
  *
  *  @retval DA16600_SUCCESS          Port opened, otherwise error.
  **********************************************************************************************************************/
-da16600_err_t rm_da16600_open_tcp_server_socket (uint16_t port)
-{
-    da16600_err_t err;
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+da16600_err_t rm_da16600_open_tcp_server_socket(uint16_t port) {
+	da16600_err_t err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ERROR_RETURN(DA16600_OPEN == p_instance_ctrl->open, FSP_ERR_NOT_OPEN);
 #endif
 
-    uint8_t cmd_buf[DA16600_COMMAND_LEN_MAX];
-    int written = snprintf((char *) cmd_buf, DA16600_COMMAND_LEN_MAX, "AT+TRTS=%d\r\n", port);
+	uint8_t cmd_buf[DA16600_COMMAND_LEN_MAX];
+	int written = snprintf((char*)cmd_buf, DA16600_COMMAND_LEN_MAX, "AT+TRTS=%d\r\n", port);
 
-    if ((written > 0) && (written < DA16600_COMMAND_LEN_MAX))
-    {
-        err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
-    }
-    else
-    {
-        err = DA16600_INVALID_PARAM;
-    }
+	if ((written > 0) && (written < DA16600_COMMAND_LEN_MAX)) {
+		err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	} else {
+		err = DA16600_INVALID_PARAM;
+	}
 
-    return err;
+	return err;
 }
 
 /**********************************************************************************************************************
@@ -405,52 +366,46 @@ da16600_err_t rm_da16600_open_tcp_server_socket (uint16_t port)
  *
  *  @retval DA16600_SUCCESS          DA16600 successfully configured.
  **********************************************************************************************************************/
-da16600_err_t rm_da16600_get_prov_info(da16600_prov_info_t * p_prov_info)
-{
-    da16600_err_t err;
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+da16600_err_t rm_da16600_get_prov_info(da16600_prov_info_t* p_prov_info) {
+	da16600_err_t err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ERROR_RETURN(DA16600_OPEN == p_instance_ctrl->open, FSP_ERR_NOT_OPEN);
 #endif
 
-    uint8_t * p_rsp_buf;
-    err = rm_da16600_send_read_cmd(p_instance_ctrl, (uint8_t *)"AT+WFJAP=?\r\n", DA16600_TIMEOUT_1SEC, &p_rsp_buf);
+	uint8_t* p_rsp_buf;
+	err = rm_da16600_send_read_cmd(p_instance_ctrl, (uint8_t*)"AT+WFJAP=?\r\n", DA16600_TIMEOUT_1SEC, &p_rsp_buf);
 
-    if (DA16600_SUCCESS == err)
-    {
-        err = DA16600_RESPONSE_INVALID;
+	if (DA16600_SUCCESS == err) {
+		err = DA16600_RESPONSE_INVALID;
 
-        /* Extract the first parameter from the response, the SSID */
-        char * param;
-        param = strtok((char *)p_rsp_buf, "'");
-        param = strtok(NULL, "'");
-        if (param != NULL)
-        {
-            if ((strlen(param) + 1) <= sizeof(p_prov_info->ssid))
-            {
-                memcpy(p_prov_info->ssid, param, strlen(param) + 1);
+		/* Extract the first parameter from the response, the SSID */
+		char* param;
+		param = strtok((char*)p_rsp_buf, "'");
+		param = strtok(NULL, "'");
+		if (param != NULL) {
+			if ((strlen(param) + 1) <= sizeof(p_prov_info->ssid)) {
+				memcpy(p_prov_info->ssid, param, strlen(param) + 1);
 
-                /* Extract password */
-                param = strtok(NULL, "'");
-                param = strtok(NULL, "'");
+				/* Extract password */
+				param = strtok(NULL, "'");
+				param = strtok(NULL, "'");
 
-                if (param != NULL)
-                {
-                    if ((strlen(param) + 1) <= sizeof(p_prov_info->password))
-                    {
-                        memcpy(p_prov_info->password, param, strlen(param) + 1);
-                        err = DA16600_SUCCESS;
-                    }
-                }
-            }
-        }
+				if (param != NULL) {
+					if ((strlen(param) + 1) <= sizeof(p_prov_info->password)) {
+						memcpy(p_prov_info->password, param, strlen(param) + 1);
+						err = DA16600_SUCCESS;
+					}
+				}
+			}
+		}
 
-        /* Free the buffer */
-        bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buf);
-        FSP_ASSERT(true == freed);
-    }
-    return err;
+		/* Free the buffer */
+		bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buf);
+		FSP_ASSERT(true == freed);
+	}
+	return err;
 }
 
 /**********************************************************************************************************************
@@ -460,43 +415,34 @@ da16600_err_t rm_da16600_get_prov_info(da16600_prov_info_t * p_prov_info)
  *
  *  @retval DA16600_SUCCESS          Status read successfully, otherwise error.
  **********************************************************************************************************************/
-da16600_err_t rm_da16600_get_wifi_connection_status (da16600_wifi_conn_status_t * p_status)
-{
-    da16600_err_t err;
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+da16600_err_t rm_da16600_get_wifi_connection_status(da16600_wifi_conn_status_t* p_status) {
+	da16600_err_t err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ERROR_RETURN(DA16600_OPEN == p_instance_ctrl->open, FSP_ERR_NOT_OPEN);
 #endif
 
-    uint8_t * p_rsp_buf;
-    err = rm_da16600_send_read_cmd(p_instance_ctrl, (uint8_t *)"AT+WFSTA\r\n", DA16600_TIMEOUT_1SEC, &p_rsp_buf);
+	uint8_t* p_rsp_buf;
+	err = rm_da16600_send_read_cmd(p_instance_ctrl, (uint8_t*)"AT+WFSTA\r\n", DA16600_TIMEOUT_1SEC, &p_rsp_buf);
 
-    if (DA16600_SUCCESS == err)
-    {
-        int status;
-        if (sscanf((const char *) p_rsp_buf, "\r\n+WFSTA:%d", &status) == 1)
-        {
-            if ((status == DA16600_WIFI_CONN_STATE_DISCONNECTED) ||
-                (status == DA16600_WIFI_CONN_STATE_CONNECTED))
-            {
-                *p_status = (da16600_wifi_conn_status_t)status;
-            }
-            else
-            {
-                err = DA16600_RESPONSE_INVALID;
-            }
-        }
-        else
-        {
-            err = DA16600_RESPONSE_INVALID;
-        }
+	if (DA16600_SUCCESS == err) {
+		int status;
+		if (sscanf((const char*)p_rsp_buf, "\r\n+WFSTA:%d", &status) == 1) {
+			if ((status == DA16600_WIFI_CONN_STATE_DISCONNECTED) || (status == DA16600_WIFI_CONN_STATE_CONNECTED)) {
+				*p_status = (da16600_wifi_conn_status_t)status;
+			} else {
+				err = DA16600_RESPONSE_INVALID;
+			}
+		} else {
+			err = DA16600_RESPONSE_INVALID;
+		}
 
-        /* Free the buffer */
-        bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buf);
-        FSP_ASSERT(true == freed);
-    }
-    return err;
+		/* Free the buffer */
+		bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buf);
+		FSP_ASSERT(true == freed);
+	}
+	return err;
 }
 
 /**********************************************************************************************************************
@@ -506,12 +452,8 @@ da16600_err_t rm_da16600_get_wifi_connection_status (da16600_wifi_conn_status_t 
  *
  *  @retval DA16600_SUCCESS          DA16600 successfully configured.
  **********************************************************************************************************************/
-static da16600_err_t rm_da16600_send_read_cmd(da16600_instance_ctrl_t *  p_instance_ctrl,
-                                              const uint8_t           *  p_textstring,
-                                              uint32_t                   timeout_ms,
-                                              uint8_t                 ** p_rsp_buf)
-{
-    da16600_err_t err = DA16600_SUCCESS;
+static da16600_err_t rm_da16600_send_read_cmd(da16600_instance_ctrl_t* p_instance_ctrl, const uint8_t* p_textstring, uint32_t timeout_ms, uint8_t** p_rsp_buf) {
+	da16600_err_t err = DA16600_SUCCESS;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ASSERT(NULL != p_instance_ctrl);
@@ -522,125 +464,99 @@ static da16600_err_t rm_da16600_send_read_cmd(da16600_instance_ctrl_t *  p_insta
     APP_PRINT("\r\nTX: %s", p_textstring);
 #endif
 
-    /* Transmit command */
-    fsp_err_t fsp_err;
-    fsp_err = p_instance_ctrl->uart_instance->p_api->write(p_instance_ctrl->uart_instance->p_ctrl,
-                                                          (uint8_t *) &p_textstring[0],
-                                                          (uint32_t)strlen((char *)p_textstring));
-    /* Wait for response */
-    if (FSP_SUCCESS == fsp_err)
-    {
-        /* Store copy of command so it can be matched to response (if required), do not include "AT"
-         * as this is not present in the response. */
-        memcpy(g_da16600_cmd_in_progress, &p_textstring[2], sizeof(g_da16600_cmd_in_progress));
-        /* Remove trailing \r\n or =? as they are not included in the response */
-        for (int i = 0; g_da16600_cmd_in_progress[i] != '\0'; i++)
-        {
-            if (g_da16600_cmd_in_progress[i] == '\r' || g_da16600_cmd_in_progress[i] == '=')
-            {
-                g_da16600_cmd_in_progress[i] = '\0';
-                break;
-            }
-        }
+	/* Transmit command */
+	fsp_err_t fsp_err;
+	fsp_err = p_instance_ctrl->uart_instance->p_api->write(p_instance_ctrl->uart_instance->p_ctrl, (uint8_t*)&p_textstring[0], (uint32_t)strlen((char*)p_textstring));
+	/* Wait for response */
+	if (FSP_SUCCESS == fsp_err) {
+		/* Store copy of command so it can be matched to response (if required), do not include "AT"
+		 * as this is not present in the response. */
+		memcpy(g_da16600_cmd_in_progress, &p_textstring[2], sizeof(g_da16600_cmd_in_progress));
+		/* Remove trailing \r\n or =? as they are not included in the response */
+		for (int i = 0; g_da16600_cmd_in_progress[i] != '\0'; i++) {
+			if (g_da16600_cmd_in_progress[i] == '\r' || g_da16600_cmd_in_progress[i] == '=') {
+				g_da16600_cmd_in_progress[i] = '\0';
+				break;
+			}
+		}
 
 #if (DA16600_DEBUG_STATS_ENABLED == 1)
-        g_tx_msg_count++;
+		g_tx_msg_count++;
 #endif
-        bool response_valid = false;
-        uint16_t tx_time = rm_time_now_ms();
+		bool response_valid = false;
+		uint16_t tx_time = rm_time_now_ms();
 
-        uint8_t * p_rsp_buffer = NULL;
-        uint8_t * p_cmd_rsp_buf = NULL;
-        bool free_buffer = false;
+		uint8_t* p_rsp_buffer = NULL;
+		uint8_t* p_cmd_rsp_buf = NULL;
+		bool free_buffer = false;
 
-        do
-        {
-            uint8_t ch;
-            if (true == rm_circ_buf_get(&rx_circ_buf, &ch))
-            {
-                rm_da16600_process_rxd_char(ch);
-            }
+		do {
+			uint8_t ch;
+			if (true == rm_circ_buf_get(&rx_circ_buf, &ch)) {
+				rm_da16600_process_rxd_char(ch);
+			}
 
-            if (true == rm_fifo_get(&p_instance_ctrl->rsp_queue, &p_rsp_buffer))
-            {
-                uint8_t * p_msg;
-                /* Strip out leading \n\r, if present */
-                if (p_rsp_buffer[0] == '\r' && p_rsp_buffer[1] == '\n')
-                {
-                    p_msg = &p_rsp_buffer[2];
-                }
-                else
-                {
-                    p_msg = p_rsp_buffer;
-                }
+			if (true == rm_fifo_get(&p_instance_ctrl->rsp_queue, &p_rsp_buffer)) {
+				uint8_t* p_msg;
+				/* Strip out leading \n\r, if present */
+				if (p_rsp_buffer[0] == '\r' && p_rsp_buffer[1] == '\n') {
+					p_msg = &p_rsp_buffer[2];
+				} else {
+					p_msg = p_rsp_buffer;
+				}
 
-                /* Is it an "OK" response */
-                if (true == rm_da16600_is_str_ok((const char *)p_msg))
-                {
-                    /* Success */
-                    if (true == response_valid)
-                    {
-                        *p_rsp_buf = p_cmd_rsp_buf;
-                        err = DA16600_SUCCESS;
-                    }
-                    else
-                    {
-                        err = DA16600_RESPONSE_INVALID;
-                    }
-                    free_buffer = true;
-                    break;
-                }
-                /* Is it an "ERROR" response */
-                else if (true == rm_da16600_is_str_err((const char *)p_msg))
-                {
-                    int error_code;
-                    if (sscanf((const char *) p_msg, "ERROR:%d", &error_code) == 1)
-                    {
-                        err = DA16600_MODULE_ERRROR + abs(error_code);
-                    }
-                    else
-                    {
-                        err = DA16600_RESPONSE_INVALID;
-                    }
-                    free_buffer = true;
-                    break;
-                }
-                /* Is it the expected response */
-                else if (true == rm_da16600_is_str_rsp((const char *)p_msg))
-                {
-                    /* Received response matching pending request, wait for OK before returning success to user */
-                    p_cmd_rsp_buf = p_rsp_buffer;
-                    response_valid = true;
-                }
-                else
-                {
-                    err = DA16600_RESPONSE_INVALID;
-                    free_buffer = true;
-                    break;
-                }
-            }
-            else
-            {
-                if (rm_time_elapsed_since_ms(tx_time) > timeout_ms)
-                {
-                    err = DA16600_RESPONSE_TIMEOUT;
-                    break;
-                }
-            }
-        } while(1);
+				/* Is it an "OK" response */
+				if (true == rm_da16600_is_str_ok((const char*)p_msg)) {
+					/* Success */
+					if (true == response_valid) {
+						*p_rsp_buf = p_cmd_rsp_buf;
+						err = DA16600_SUCCESS;
+					} else {
+						err = DA16600_RESPONSE_INVALID;
+					}
+					free_buffer = true;
+					break;
+				}
+				/* Is it an "ERROR" response */
+				else if (true == rm_da16600_is_str_err((const char*)p_msg)) {
+					int error_code;
+					if (sscanf((const char*)p_msg, "ERROR:%d", &error_code) == 1) {
+						err = DA16600_MODULE_ERRROR + abs(error_code);
+					} else {
+						err = DA16600_RESPONSE_INVALID;
+					}
+					free_buffer = true;
+					break;
+				}
+				/* Is it the expected response */
+				else if (true == rm_da16600_is_str_rsp((const char*)p_msg)) {
+					/* Received response matching pending request, wait for OK before returning success to user */
+					p_cmd_rsp_buf = p_rsp_buffer;
+					response_valid = true;
+				} else {
+					err = DA16600_RESPONSE_INVALID;
+					free_buffer = true;
+					break;
+				}
+			} else {
+				if (rm_time_elapsed_since_ms(tx_time) > timeout_ms) {
+					err = DA16600_RESPONSE_TIMEOUT;
+					break;
+				}
+			}
+		} while (1);
 
-        if (true == free_buffer)
-        {
-            /* Free the buffer */
-            bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buffer);
-            FSP_ASSERT(true == freed);
-        }
+		if (true == free_buffer) {
+			/* Free the buffer */
+			bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buffer);
+			FSP_ASSERT(true == freed);
+		}
 
-        /* Command execution complete */
-        g_da16600_cmd_in_progress[0] = '\0';
-    }
+		/* Command execution complete */
+		g_da16600_cmd_in_progress[0] = '\0';
+	}
 
-    return err;
+	return err;
 }
 
 /**********************************************************************************************************************
@@ -650,11 +566,8 @@ static da16600_err_t rm_da16600_send_read_cmd(da16600_instance_ctrl_t *  p_insta
  *
  *  @retval DA16600_SUCCESS          Write command accepted by module
  **********************************************************************************************************************/
-static da16600_err_t rm_da16600_send_write_cmd(da16600_instance_ctrl_t * p_instance_ctrl,
-                                               const uint8_t           * p_textstring,
-                                               uint32_t                  timeout_ms)
-{
-    da16600_err_t err = DA16600_UART_ERROR;
+da16600_err_t rm_da16600_send_write_cmd(da16600_instance_ctrl_t* p_instance_ctrl, const uint8_t* p_textstring, uint32_t timeout_ms) {
+	da16600_err_t err = DA16600_UART_ERROR;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ASSERT(NULL != p_instance_ctrl);
@@ -665,86 +578,66 @@ static da16600_err_t rm_da16600_send_write_cmd(da16600_instance_ctrl_t * p_insta
     APP_PRINT("\r\nTX: %s", p_textstring);
 #endif
 
-    /* Transmit command */
-    fsp_err_t fsp_err;
-    fsp_err = p_instance_ctrl->uart_instance->p_api->write(p_instance_ctrl->uart_instance->p_ctrl,
-                                                          &p_textstring[0],
-                                                 (uint32_t)strlen((char *)p_textstring));
-    /* Wait for response */
-    if (FSP_SUCCESS == fsp_err)
-    {
-        /* Store copy of command so it can be matched to response (if required) */
-        memcpy(g_da16600_cmd_in_progress, p_textstring, sizeof(g_da16600_cmd_in_progress));
+	/* Transmit command */
+	fsp_err_t fsp_err;
+	fsp_err = p_instance_ctrl->uart_instance->p_api->write(p_instance_ctrl->uart_instance->p_ctrl, &p_textstring[0], (uint32_t)strlen((char*)p_textstring));
+	/* Wait for response */
+	if (FSP_SUCCESS == fsp_err) {
+		/* Store copy of command so it can be matched to response (if required) */
+		memcpy(g_da16600_cmd_in_progress, p_textstring, sizeof(g_da16600_cmd_in_progress));
 
 #if (DA16600_DEBUG_STATS_ENABLED == 1)
-        g_tx_msg_count++;
+		g_tx_msg_count++;
 #endif
-        uint16_t tx_time = rm_time_now_ms();
+		uint16_t tx_time = rm_time_now_ms();
 
-        do
-        {
-            uint8_t ch;
-            if (true == rm_circ_buf_get(&rx_circ_buf, &ch))
-            {
-                rm_da16600_process_rxd_char(ch);
-            }
+		do {
+			uint8_t ch;
+			if (true == rm_circ_buf_get(&rx_circ_buf, &ch)) {
+				rm_da16600_process_rxd_char(ch);
+			}
 
-            uint8_t * p_rsp_buffer;
-            if (true == rm_fifo_get(&p_instance_ctrl->rsp_queue, &p_rsp_buffer))
-            {
-                uint8_t * p_msg;
-                /* Strip out leading \n\r, if present */
-                if (p_rsp_buffer[0] == '\r' && p_rsp_buffer[1] == '\n')
-                {
-                    p_msg = &p_rsp_buffer[2];
-                }
-                else
-                {
-                    p_msg = p_rsp_buffer;
-                }
+			uint8_t* p_rsp_buffer;
+			if (true == rm_fifo_get(&p_instance_ctrl->rsp_queue, &p_rsp_buffer)) {
+				uint8_t* p_msg;
+				/* Strip out leading \n\r, if present */
+				if (p_rsp_buffer[0] == '\r' && p_rsp_buffer[1] == '\n') {
+					p_msg = &p_rsp_buffer[2];
+				} else {
+					p_msg = p_rsp_buffer;
+				}
 
-                if (true == rm_da16600_is_str_ok((const char *)p_msg))
-                {
-                    /* Success */
-                    err = DA16600_SUCCESS;
-                }
-                else if (true == rm_da16600_is_str_err((const char *)p_msg))
-                {
-                    int error_code;
-                    if (sscanf((const char *)p_msg, "ERROR:%d", &error_code) == 1)
-                    {
-                        err = DA16600_MODULE_ERRROR + abs(error_code);
-                    }
-                    else
-                    {
-                        err = DA16600_RESPONSE_INVALID;
-                    }
-                }
-                else
-                {
-                    err = DA16600_RESPONSE_INVALID;
-                }
+				if (true == rm_da16600_is_str_ok((const char*)p_msg)) {
+					/* Success */
+					err = DA16600_SUCCESS;
+				} else if (true == rm_da16600_is_str_err((const char*)p_msg)) {
+					int error_code;
+					if (sscanf((const char*)p_msg, "ERROR:%d", &error_code) == 1) {
+						err = DA16600_MODULE_ERRROR + abs(error_code);
+					} else {
+						err = DA16600_RESPONSE_INVALID;
+					}
+				} else {
+					err = DA16600_RESPONSE_INVALID;
+				}
 
-                /* Free the buffer */
-                bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buffer);
-                FSP_ASSERT(true == freed);
-                break;
-            }
-            else
-            {
-                if (rm_time_elapsed_since_ms(tx_time) > timeout_ms)
-                {
-                    err = DA16600_RESPONSE_TIMEOUT;
-                    break;
-                }
-            }
-        } while(1);
+				/* Free the buffer */
+				bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buffer);
+				FSP_ASSERT(true == freed);
+				break;
+			} else {
+				if (rm_time_elapsed_since_ms(tx_time) > timeout_ms) {
+					err = DA16600_RESPONSE_TIMEOUT;
+					break;
+				}
+			}
+		} while (1);
 
-        /* Command execution complete */
-        g_da16600_cmd_in_progress[0] = '\0';
-    }
+		/* Command execution complete */
+		g_da16600_cmd_in_progress[0] = '\0';
+	}
 
-    return err;
+	return err;
 }
 
 /**********************************************************************************************************************
@@ -752,12 +645,10 @@ static da16600_err_t rm_da16600_send_write_cmd(da16600_instance_ctrl_t * p_insta
  *
  *  @param[in]  p_args               Callback parameters.
  **********************************************************************************************************************/
-void rm_da16600_uart_callback(uart_callback_args_t *p_args)
-{
-    if (UART_EVENT_RX_CHAR == p_args->event)
-    {
-        (void)rm_circ_buf_put(&rx_circ_buf, (uint8_t)p_args->data);
-    }
+void rm_da16600_uart_callback(uart_callback_args_t* p_args) {
+	if (UART_EVENT_RX_CHAR == p_args->event) {
+		(void)rm_circ_buf_put(&rx_circ_buf, (uint8_t)p_args->data);
+	}
 }
 
 /**********************************************************************************************************************
@@ -765,170 +656,132 @@ void rm_da16600_uart_callback(uart_callback_args_t *p_args)
  *
  *  @param[in]  ch           Received character.
  **********************************************************************************************************************/
-static void rm_da16600_process_rxd_char(uint8_t ch)
-{
-    static uint16_t  ix;
-    static uint8_t * p_rx_buffer;
+static void rm_da16600_process_rxd_char(uint8_t ch) {
+	static uint16_t ix;
+	static uint8_t* p_rx_buffer;
 
-    switch (g_rx_state)
-    {
-        case DA16600_RX_STATE_IDLE:
-        {
-            da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+	switch (g_rx_state) {
+		case DA16600_RX_STATE_IDLE: {
+			da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
-            if (ch == '\r')
-            {
-                bool buf_available;
-                /* Start of message, get buffer to store it in, if no buffers available then silently discard.. */
-                if ((buf_available = rm_fifo_get(&p_instance_ctrl->buf_queue, &p_rx_buffer)) == true)
-                {
-                    ix = 0;
-                    p_rx_buffer[ix++] = ch;
-                    g_rx_state = DA16600_RX_STATE_PREFIX;
-                }
-                FSP_ASSERT(true == buf_available);
-            }
-            else if (ch == '\n')
-            {
-                /* Character received out of order, reset state machine */
-                FSP_ASSERT(ch != '\n');
-                g_rx_state = DA16600_RX_STATE_IDLE;
-            }
-            else
-            {
-                bool buf_available;
-                /* Start of message that does not contain \n\r prefix, get buffer to store it in, if no buffers available then silently discard.. */
-                if ((buf_available = rm_fifo_get(&p_instance_ctrl->buf_queue, &p_rx_buffer)) == true)
-                {
-                    ix = 0;
-                    p_rx_buffer[ix++] = ch;
-                    g_rx_state = DA16600_RX_STATE_DATA;
-                }
-                FSP_ASSERT(true == buf_available);
-            }
-        }
-        break;
+			if (ch == '\r') {
+				bool buf_available;
+				/* Start of message, get buffer to store it in, if no buffers available then silently discard.. */
+				if ((buf_available = rm_fifo_get(&p_instance_ctrl->buf_queue, &p_rx_buffer)) == true) {
+					ix = 0;
+					p_rx_buffer[ix++] = ch;
+					g_rx_state = DA16600_RX_STATE_PREFIX;
+				}
+				FSP_ASSERT(true == buf_available);
+			} else if (ch == '\n') {
+				/* Character received out of order, reset state machine */
+				FSP_ASSERT(ch != '\n');
+				g_rx_state = DA16600_RX_STATE_IDLE;
+			} else {
+				bool buf_available;
+				/* Start of message that does not contain \n\r prefix, get buffer to store it in, if no buffers available then silently discard.. */
+				if ((buf_available = rm_fifo_get(&p_instance_ctrl->buf_queue, &p_rx_buffer)) == true) {
+					ix = 0;
+					p_rx_buffer[ix++] = ch;
+					g_rx_state = DA16600_RX_STATE_DATA;
+				}
+				FSP_ASSERT(true == buf_available);
+			}
+		}
+			break;
 
-        case DA16600_RX_STATE_PREFIX:
-        {
-            if (ch == '\n')
-            {
-                p_rx_buffer[ix++] = ch;
-                FSP_ASSERT(ix < DA16600_CFG_RX_BUF_LEN);
+		case DA16600_RX_STATE_PREFIX: {
+			if (ch == '\n') {
+				p_rx_buffer[ix++] = ch;
+				FSP_ASSERT(ix < DA16600_CFG_RX_BUF_LEN);
 
-                if (ix < DA16600_CFG_RX_BUF_LEN)
-                {
-                    g_rx_state = DA16600_RX_STATE_DATA;
-                }
-                else
-                {
-                    /* Buffer overflow */
-                    g_rx_state = DA16600_RX_STATE_IDLE;
-                }
-            }
-            else
-            {
-                /* Character received out of order, free buffer and reset state machine */
-                da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
-                bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
-                FSP_ASSERT(true == freed);
+				if (ix < DA16600_CFG_RX_BUF_LEN) {
+					g_rx_state = DA16600_RX_STATE_DATA;
+				} else {
+					/* Buffer overflow */
+					g_rx_state = DA16600_RX_STATE_IDLE;
+				}
+			} else {
+				/* Character received out of order, free buffer and reset state machine */
+				da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+				bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
+				FSP_ASSERT(true == freed);
 
-                g_rx_state = DA16600_RX_STATE_IDLE;
-            }
-        }
-        break;
+				g_rx_state = DA16600_RX_STATE_IDLE;
+			}
+		}
+			break;
 
-        case DA16600_RX_STATE_DATA:
-        {
-            if (ch == '\r')
-            {
-                p_rx_buffer[ix++] = ch;
-                FSP_ASSERT(ix < DA16600_CFG_RX_BUF_LEN);
+		case DA16600_RX_STATE_DATA: {
+			if (ch == '\r') {
+				p_rx_buffer[ix++] = ch;
+				FSP_ASSERT(ix < DA16600_CFG_RX_BUF_LEN);
 
-                if (ix < DA16600_CFG_RX_BUF_LEN)
-                {
-                    g_rx_state = DA16600_RX_STATE_SUFFIX;
-                }
-                else
-                {
-                    /* Buffer overflow */
-                    g_rx_state = DA16600_RX_STATE_IDLE;
-                }
-            }
-            else if (ch == '\n')
-            {
-                /* Character received out of order, free buffer and reset state machine */
-                da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
-                bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
-                FSP_ASSERT(true == freed);
+				if (ix < DA16600_CFG_RX_BUF_LEN) {
+					g_rx_state = DA16600_RX_STATE_SUFFIX;
+				} else {
+					/* Buffer overflow */
+					g_rx_state = DA16600_RX_STATE_IDLE;
+				}
+			} else if (ch == '\n') {
+				/* Character received out of order, free buffer and reset state machine */
+				da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+				bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
+				FSP_ASSERT(true == freed);
 
-                g_rx_state = DA16600_RX_STATE_IDLE;
-            }
-            else
-            {
-                p_rx_buffer[ix++] = ch;
-                FSP_ASSERT(ix < DA16600_CFG_RX_BUF_LEN);
+				g_rx_state = DA16600_RX_STATE_IDLE;
+			} else {
+				p_rx_buffer[ix++] = ch;
+				FSP_ASSERT(ix < DA16600_CFG_RX_BUF_LEN);
 
-                if (ix >= DA16600_CFG_RX_BUF_LEN)
-                {
-                    /* Buffer overflow */
-                    g_rx_state = DA16600_RX_STATE_IDLE;
-                }
-            }
-        }
-        break;
+				if (ix >= DA16600_CFG_RX_BUF_LEN) {
+					/* Buffer overflow */
+					g_rx_state = DA16600_RX_STATE_IDLE;
+				}
+			}
+		}
+			break;
 
-        case DA16600_RX_STATE_SUFFIX:
-        {
-            if (ch == '\n')
-            {
-                /* Message reception complete, add NULL so it can be handled as a string. */
-                p_rx_buffer[ix++] = ch;
-                FSP_ASSERT(ix < DA16600_CFG_RX_BUF_LEN);
+		case DA16600_RX_STATE_SUFFIX: {
+			if (ch == '\n') {
+				/* Message reception complete, add NULL so it can be handled as a string. */
+				p_rx_buffer[ix++] = ch;
+				FSP_ASSERT(ix < DA16600_CFG_RX_BUF_LEN);
 
-                if (ix < DA16600_CFG_RX_BUF_LEN)
-                {
-                    p_rx_buffer[ix] = '\0';
+				if (ix < DA16600_CFG_RX_BUF_LEN) {
+					p_rx_buffer[ix] = '\0';
 
-                    /* Don't pass on messages that are just \r\n */
-                    if (ix > 2)
-                    {
-                        rm_da16600_process_rxd_message(p_rx_buffer);
-                    }
-                    else
-                    {
-                        da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
-                        bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
-                        FSP_ASSERT(true == freed);
-                   }
-                }
-                else
-                {
-                    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
-                    bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
-                    FSP_ASSERT(true == freed);
-                }
-                g_rx_state = DA16600_RX_STATE_IDLE;
-            }
-            else
-            {
-                /* Character received out of order, free buffer and reset state machine */
-                da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
-                bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
-                FSP_ASSERT(true == freed);
+					/* Don't pass on messages that are just \r\n */
+					if (ix > 2) {
+						rm_da16600_process_rxd_message(p_rx_buffer);
+					} else {
+						da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+						bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
+						FSP_ASSERT(true == freed);
+					}
+				} else {
+					da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+					bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
+					FSP_ASSERT(true == freed);
+				}
+				g_rx_state = DA16600_RX_STATE_IDLE;
+			} else {
+				/* Character received out of order, free buffer and reset state machine */
+				da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+				bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rx_buffer);
+				FSP_ASSERT(true == freed);
 
-                g_rx_state = DA16600_RX_STATE_IDLE;
-            }
-        }
-        break;
+				g_rx_state = DA16600_RX_STATE_IDLE;
+			}
+		}
+			break;
 
-        default:
-        {
-            /* Unknown state */
-            FSP_ASSERT(g_rx_state <= DA16600_RX_STATE_SUFFIX);
-        }
-        break;
-    }
+		default: {
+			/* Unknown state */
+			FSP_ASSERT(g_rx_state <= DA16600_RX_STATE_SUFFIX);
+		}
+			break;
+	}
 }
 
 /**********************************************************************************************************************
@@ -936,17 +789,16 @@ static void rm_da16600_process_rxd_char(uint8_t ch)
  *
  *  @param[in]  p_buf       Pointer to buffer containing message.
  **********************************************************************************************************************/
-static void rm_da16600_process_rxd_message(uint8_t * p_buf)
-{
-    bool message_handled = false;
+static void rm_da16600_process_rxd_message(uint8_t* p_buf) {
+	bool message_handled = false;
 
 #if (DA16600_DEBUG_STATS_ENABLED == 1)
-    g_rx_msg_count++;
+	g_rx_msg_count++;
 #endif
 
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
-    uint8_t * p_msg;
+	uint8_t* p_msg;
 
 #if 0
     if ((p_buf != &p_instance_ctrl->buf_pool[0][0]) &&
@@ -958,60 +810,47 @@ static void rm_da16600_process_rxd_message(uint8_t * p_buf)
     }
 #endif
 
-    /* Strip out leading \n\r, if present */
-    if (p_buf[0] == '\r' && p_buf[1] == '\n')
-    {
-        p_msg = &p_buf[2];
-    }
-    else
-    {
-        p_msg = p_buf;
-    }
+	/* Strip out leading \n\r, if present */
+	if (p_buf[0] == '\r' && p_buf[1] == '\n') {
+		p_msg = &p_buf[2];
+	} else {
+		p_msg = p_buf;
+	}
 
 #ifdef DA16600_PRINTF_DEBUG_ENABLED
     APP_PRINT("\r\nRX (%d): %s", (g_da16600_cmd_in_progress[0] != '\0'), p_msg);
 #endif
 
-    if (g_da16600_cmd_in_progress[0] != '\0')
-    {
-        if ((rm_da16600_is_str_ok((const char *)p_msg) == true) ||
-            (rm_da16600_is_str_err((const char *)p_msg) == true) ||
-            (rm_da16600_is_str_rsp((const char *)p_msg) == true))
-        {
-            /* Add received message to response queue */
-            if (false == rm_fifo_put(&p_instance_ctrl->rsp_queue, &p_buf))
-            {
-                /* Unable to add to response queue so free the buffer */
-                bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_buf);
-                FSP_ASSERT(false == freed);
-            }
-            message_handled = true;
-        }
-    }
-    else if (true == g_rx_data_in_progress)
-    {
-        rm_da16600_handle_data_chunk(p_buf);
-        message_handled = true;
+	if (g_da16600_cmd_in_progress[0] != '\0') {
+		if ((rm_da16600_is_str_ok((const char*)p_msg) == true) || (rm_da16600_is_str_err((const char*)p_msg) == true) || (rm_da16600_is_str_rsp((const char*)p_msg) == true)) {
+			/* Add received message to response queue */
+			if (false == rm_fifo_put(&p_instance_ctrl->rsp_queue, &p_buf)) {
+				/* Unable to add to response queue so free the buffer */
+				bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_buf);
+				FSP_ASSERT(false == freed);
+			}
+			message_handled = true;
+		}
+	} else if (true == g_rx_data_in_progress) {
+		rm_da16600_handle_data_chunk(p_buf);
+		message_handled = true;
 
-        /* Free the buffer */
-        bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_buf);
-        FSP_ASSERT(true == freed);
-    }
+		/* Free the buffer */
+		bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_buf);
+		FSP_ASSERT(true == freed);
+	}
 
-    if (false == message_handled)
-    {
-        for (uint8_t i = 0; rsp_handlers[i].handler != NULL; i++)
-        {
-            if (0 == strncmp(rsp_handlers[i].p_rsp, (const char *)p_msg, strlen(rsp_handlers[i].p_rsp)))
-            {
-              rsp_handlers[i].handler(p_msg);
-              break;
-            }
-        }
-        /* Free the buffer */
-        bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_buf);
-        FSP_ASSERT(true == freed);
-    }
+	if (false == message_handled) {
+		for (uint8_t i = 0; rsp_handlers[i].handler != NULL; i++) {
+			if (0 == strncmp(rsp_handlers[i].p_rsp, (const char*)p_msg, strlen(rsp_handlers[i].p_rsp))) {
+				rsp_handlers[i].handler(p_msg);
+				break;
+			}
+		}
+		/* Free the buffer */
+		bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_buf);
+		FSP_ASSERT(true == freed);
+	}
 }
 
 /**********************************************************************************************************************
@@ -1019,246 +858,222 @@ static void rm_da16600_process_rxd_message(uint8_t * p_buf)
  *
  *  @param[in]  p_buf       Pointer to buffer containing message and parameters.
  **********************************************************************************************************************/
-static void rm_da16600_handle_init(uint8_t * p_buf)
-{
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+static void rm_da16600_handle_init(uint8_t* p_buf) {
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ASSERT(NULL != p_instance_ctrl->p_callback);
 #endif
 
-    int mode;
-    if (sscanf((const char *) p_buf, "+INIT:DONE,%d", &mode) == 1)
-    {
-        g_rm16600_callback_args.event = DA16600_EVENT_INIT;
-        g_rm16600_callback_args.param.init.mode = (uint8_t)mode;
+	int mode;
+	if (sscanf((const char*)p_buf, "+INIT:DONE,%d", &mode) == 1) {
+		g_rm16600_callback_args.event = DA16600_EVENT_INIT;
+		g_rm16600_callback_args.param.init.mode = (uint8_t)mode;
 
-        p_instance_ctrl->p_callback(&g_rm16600_callback_args);
-    }
+		p_instance_ctrl->p_callback(&g_rm16600_callback_args);
+	}
 }
-
 
 /**********************************************************************************************************************
  *  Handle joined WiFi access point message.
  *
  *  @param[in]  p_buf       Pointer to buffer containing message and parameters.
  **********************************************************************************************************************/
-static void rm_da16600_handle_wfjap(uint8_t * p_buf)
-{
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+static void rm_da16600_handle_wfjap(uint8_t* p_buf) {
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ASSERT(NULL != p_instance_ctrl->p_callback);
 #endif
 
-    int result;
-    if (sscanf((const char *) p_buf, "+WFJAP:%d", &result) == 1)
-    {
-        g_rm16600_callback_args.event = DA16600_EVENT_JOINED_ACCESS_POINT,
-        g_rm16600_callback_args.param.joined_ap.result = (uint8_t)result;
+	int result;
+	if (sscanf((const char*)p_buf, "+WFJAP:%d", &result) == 1) {
+		g_rm16600_callback_args.event = DA16600_EVENT_JOINED_ACCESS_POINT, g_rm16600_callback_args.param.joined_ap.result = (uint8_t)result;
 
-        if (result == 1)
-        {
-            /* IP Address follows second comma (+WFJAP:1,'<SSID>',<IP Address>)*/
-            char *ip_addr = rm_da16600_findnchr((const char *)p_buf, ',', 2);
-            if (ip_addr)
-            {
-                int ip_add_0, ip_add_1, ip_add_2, ip_add_3;
-                if (sscanf((const char *) ip_addr, ",%d.%d.%d.%d",
-                           &ip_add_0, &ip_add_1, &ip_add_2, &ip_add_3) == 4)
-                {
-                    g_rm16600_callback_args.param.joined_ap.ip_addr[0] = (uint8_t)ip_add_0;
-                    g_rm16600_callback_args.param.joined_ap.ip_addr[1] = (uint8_t)ip_add_1;
-                    g_rm16600_callback_args.param.joined_ap.ip_addr[2] = (uint8_t)ip_add_2;
-                    g_rm16600_callback_args.param.joined_ap.ip_addr[3] = (uint8_t)ip_add_3;
-                }
-            }
-        }
-        p_instance_ctrl->p_callback(&g_rm16600_callback_args);
-    }
+		if (result == 1) {
+			/* IP Address follows second comma (+WFJAP:1,'<SSID>',<IP Address>)*/
+			char* ip_addr = rm_da16600_findnchr((const char*)p_buf, ',', 2);
+			if (ip_addr) {
+				int ip_add_0, ip_add_1, ip_add_2, ip_add_3;
+				if (sscanf((const char*)ip_addr, ",%d.%d.%d.%d", &ip_add_0, &ip_add_1, &ip_add_2, &ip_add_3) == 4) {
+					g_rm16600_callback_args.param.joined_ap.ip_addr[0] = (uint8_t)ip_add_0;
+					g_rm16600_callback_args.param.joined_ap.ip_addr[1] = (uint8_t)ip_add_1;
+					g_rm16600_callback_args.param.joined_ap.ip_addr[2] = (uint8_t)ip_add_2;
+					g_rm16600_callback_args.param.joined_ap.ip_addr[3] = (uint8_t)ip_add_3;
+				}
+			}
+		}
+		p_instance_ctrl->p_callback(&g_rm16600_callback_args);
+	}
 }
-
 
 /**********************************************************************************************************************
  *  Handle WiFi disconnected message.
  *
  *  @param[in]  p_buf       Pointer to buffer containing message and parameters.
  **********************************************************************************************************************/
-static void rm_da16600_handle_wfdap(uint8_t * p_buf)
-{
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+static void rm_da16600_handle_wfdap(uint8_t* p_buf) {
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ASSERT(NULL != p_instance_ctrl->p_callback);
 #endif
 
-    if (0 == strncmp((const char *) p_buf,
-                     (const char *) "+WFDAP:0",
-              strlen((const char *) "+WFDAP:0")))
-    {
-        g_rm16600_callback_args.event = DA16600_EVENT_WIFI_DISCONNECTED;
+	if (0 == strncmp((const char*)p_buf, (const char*)"+WFDAP:0", strlen((const char*)"+WFDAP:0"))) {
+		g_rm16600_callback_args.event = DA16600_EVENT_WIFI_DISCONNECTED;
 
-        p_instance_ctrl->p_callback(&g_rm16600_callback_args);
-    }
+		p_instance_ctrl->p_callback(&g_rm16600_callback_args);
+	}
 }
-
 
 /**********************************************************************************************************************
  *  Handle TCP client connected message.
  *
  *  @param[in]  p_buf       Pointer to buffer containing message and parameters.
  **********************************************************************************************************************/
-static void rm_da16600_handle_trcts(uint8_t * p_buf)
-{
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+static void rm_da16600_handle_trcts(uint8_t* p_buf) {
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ASSERT(NULL != p_instance_ctrl->p_callback);
 #endif
 
-    int ip_add_0, ip_add_1, ip_add_2, ip_add_3;
-    int port;
-    if (sscanf((const char *) p_buf, "+TRCTS:0,%d.%d.%d.%d,%d", &ip_add_0, &ip_add_1, &ip_add_2, &ip_add_3, &port) == 5)
-    {
-        g_rm16600_callback_args.event = DA16600_EVENT_TCP_CLIENT_CONNECTED;
-        g_rm16600_callback_args.param.tcp_client_connected.ip_addr[0] = (uint8_t)ip_add_0;
-        g_rm16600_callback_args.param.tcp_client_connected.ip_addr[1] = (uint8_t)ip_add_1;
-        g_rm16600_callback_args.param.tcp_client_connected.ip_addr[2] = (uint8_t)ip_add_2;
-        g_rm16600_callback_args.param.tcp_client_connected.ip_addr[3] = (uint8_t)ip_add_3;
-        g_rm16600_callback_args.param.tcp_client_connected.port = (uint16_t)port;
+	int ip_add_0, ip_add_1, ip_add_2, ip_add_3;
+	int port;
+	if (sscanf((const char*)p_buf, "+TRCTS:0,%d.%d.%d.%d,%d", &ip_add_0, &ip_add_1, &ip_add_2, &ip_add_3, &port) == 5) {
+		g_rm16600_callback_args.event = DA16600_EVENT_TCP_CLIENT_CONNECTED;
+		g_rm16600_callback_args.param.tcp_client_connected.ip_addr[0] = (uint8_t)ip_add_0;
+		g_rm16600_callback_args.param.tcp_client_connected.ip_addr[1] = (uint8_t)ip_add_1;
+		g_rm16600_callback_args.param.tcp_client_connected.ip_addr[2] = (uint8_t)ip_add_2;
+		g_rm16600_callback_args.param.tcp_client_connected.ip_addr[3] = (uint8_t)ip_add_3;
+		g_rm16600_callback_args.param.tcp_client_connected.port = (uint16_t)port;
 
-        p_instance_ctrl->p_callback(&g_rm16600_callback_args);
-    }
+		p_instance_ctrl->p_callback(&g_rm16600_callback_args);
+	}
 }
-
 
 /**********************************************************************************************************************
  *  Handle TCP client disconnected message.
  *
  *  @param[in]  p_buf       Pointer to buffer containing message parameters.
  **********************************************************************************************************************/
-static void rm_da16600_handle_trxts(uint8_t * p_buf)
-{
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+static void rm_da16600_handle_trxts(uint8_t* p_buf) {
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ASSERT(NULL != p_instance_ctrl->p_callback);
 #endif
 
-    int ip_add_0, ip_add_1, ip_add_2, ip_add_3;
-    int port;
-    if (sscanf((const char *) p_buf, "+TRXTS:0,%d.%d.%d.%d,%d", &ip_add_0, &ip_add_1, &ip_add_2, &ip_add_3, &port) == 5)
-    {
-        g_rm16600_callback_args.event = DA16600_EVENT_TCP_CLIENT_DISCONNECTED;
-        g_rm16600_callback_args.param.tcp_client_disconnected.ip_addr[0] = (uint8_t)ip_add_0;
-        g_rm16600_callback_args.param.tcp_client_disconnected.ip_addr[1] = (uint8_t)ip_add_1;
-        g_rm16600_callback_args.param.tcp_client_disconnected.ip_addr[2] = (uint8_t)ip_add_2;
-        g_rm16600_callback_args.param.tcp_client_disconnected.ip_addr[3] = (uint8_t)ip_add_3;
-        g_rm16600_callback_args.param.tcp_client_disconnected.port = (uint16_t)port;
+	int ip_add_0, ip_add_1, ip_add_2, ip_add_3;
+	int port;
+	if (sscanf((const char*)p_buf, "+TRXTS:0,%d.%d.%d.%d,%d", &ip_add_0, &ip_add_1, &ip_add_2, &ip_add_3, &port) == 5) {
+		g_rm16600_callback_args.event = DA16600_EVENT_TCP_CLIENT_DISCONNECTED;
+		g_rm16600_callback_args.param.tcp_client_disconnected.ip_addr[0] = (uint8_t)ip_add_0;
+		g_rm16600_callback_args.param.tcp_client_disconnected.ip_addr[1] = (uint8_t)ip_add_1;
+		g_rm16600_callback_args.param.tcp_client_disconnected.ip_addr[2] = (uint8_t)ip_add_2;
+		g_rm16600_callback_args.param.tcp_client_disconnected.ip_addr[3] = (uint8_t)ip_add_3;
+		g_rm16600_callback_args.param.tcp_client_disconnected.port = (uint16_t)port;
 
-        p_instance_ctrl->p_callback(&g_rm16600_callback_args);
-    }
+		p_instance_ctrl->p_callback(&g_rm16600_callback_args);
+	}
 }
-
 
 /**********************************************************************************************************************
  *  Handle chunk of TCP data received from module.
  *
  *  @param[in]  p_buf       Pointer to buffer containing data.
  **********************************************************************************************************************/
-static void rm_da16600_handle_data_chunk(uint8_t * p_buf)
-{
-    /* Add chunk to buffer */
-    if ((g_rx_data_len + strlen((const char *)p_buf)) < DA16600_CFG_RX_BUF_LEN)
-    {
-        memcpy(&g_rm16600_callback_args.param.tcp_client_received_data.data[g_rx_data_len],
-               p_buf,
-               strlen((const char *)p_buf));
+static void rm_da16600_handle_data_chunk(uint8_t* p_buf) {
+	/* Add chunk to buffer */
+	if ((g_rx_data_len + strlen((const char*)p_buf)) < DA16600_CFG_RX_BUF_LEN) {
+		memcpy(&g_rm16600_callback_args.param.tcp_client_received_data.data[g_rx_data_len], p_buf, strlen((const char*)p_buf));
 
-        g_rx_data_len +=  strlen((const char *)p_buf);
+		g_rx_data_len += strlen((const char*)p_buf);
 
-        if (g_rx_data_len >= g_rm16600_callback_args.param.tcp_client_received_data.length)
-        {
-            da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+		if (g_rx_data_len >= g_rm16600_callback_args.param.tcp_client_received_data.length) {
+			da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
-            /* NULL terminate so data can be handled by string processing functions */
-            g_rm16600_callback_args.param.tcp_client_received_data.data[g_rx_data_len] = '\0';
-            p_instance_ctrl->p_callback(&g_rm16600_callback_args);
-            g_rx_data_in_progress = false;
-        }
-    }
-    else
-    {
-        FSP_ASSERT((g_rx_data_len + strlen((const char *)p_buf)) < DA16600_CFG_RX_BUF_LEN);
-        /* Too much data for buffer... */
-        g_rx_data_in_progress = false;
-    }
+			/* NULL terminate so data can be handled by string processing functions */
+			g_rm16600_callback_args.param.tcp_client_received_data.data[g_rx_data_len] = '\0';
+			p_instance_ctrl->p_callback(&g_rm16600_callback_args);
+			g_rx_data_in_progress = false;
+		}
+	} else {
+		FSP_ASSERT((g_rx_data_len + strlen((const char *)p_buf)) < DA16600_CFG_RX_BUF_LEN);
+		/* Too much data for buffer... */
+		g_rx_data_in_progress = false;
+	}
 }
-
 
 /**********************************************************************************************************************
  *  Handle received TCP data command from module.
  *
  *  @param[in]  p_buf       Pointer to buffer containing received TCP data.
  **********************************************************************************************************************/
-static void rm_da16600_handle_trdts(uint8_t * p_buf)
-{
-    da16600_instance_ctrl_t * p_instance_ctrl = &g_rm_da16600_instance;
+static void rm_da16600_handle_trdts(uint8_t* p_buf) {
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
 
 #if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
     FSP_ASSERT(NULL != p_instance_ctrl->p_callback);
 #endif
 
-    int ip_add_0, ip_add_1, ip_add_2, ip_add_3;
-    int port;
-    int length;
-    if (sscanf((const char *) p_buf, "+TRDTS:0,%d.%d.%d.%d,%d,%d",
-               &ip_add_0, &ip_add_1, &ip_add_2, &ip_add_3, &port, &length) == 6)
-    {
-        if (sizeof(g_rm16600_callback_args.param.tcp_client_received_data.data) >=
-                g_rm16600_callback_args.param.tcp_client_received_data.length)
-        {
-            g_rm16600_callback_args.param.tcp_client_received_data.ip_addr[0] = (uint8_t)ip_add_0;
-            g_rm16600_callback_args.param.tcp_client_received_data.ip_addr[1] = (uint8_t)ip_add_1;
-            g_rm16600_callback_args.param.tcp_client_received_data.ip_addr[2] = (uint8_t)ip_add_2;
-            g_rm16600_callback_args.param.tcp_client_received_data.ip_addr[3] = (uint8_t)ip_add_3;
-            g_rm16600_callback_args.param.tcp_client_received_data.port = (uint16_t)port;
-            g_rm16600_callback_args.param.tcp_client_received_data.length = (uint32_t)length;
+	int ip_add_0, ip_add_1, ip_add_2, ip_add_3;
+	int port;
+	int length;
+	if (sscanf((const char*)p_buf, "+TRDTS:0,%d.%d.%d.%d,%d,%d", &ip_add_0, &ip_add_1, &ip_add_2, &ip_add_3, &port, &length) == 6) {
+		if (sizeof(g_rm16600_callback_args.param.tcp_client_received_data.data) >= g_rm16600_callback_args.param.tcp_client_received_data.length) {
+			g_rm16600_callback_args.param.tcp_client_received_data.ip_addr[0] = (uint8_t)ip_add_0;
+			g_rm16600_callback_args.param.tcp_client_received_data.ip_addr[1] = (uint8_t)ip_add_1;
+			g_rm16600_callback_args.param.tcp_client_received_data.ip_addr[2] = (uint8_t)ip_add_2;
+			g_rm16600_callback_args.param.tcp_client_received_data.ip_addr[3] = (uint8_t)ip_add_3;
+			g_rm16600_callback_args.param.tcp_client_received_data.port = (uint16_t)port;
+			g_rm16600_callback_args.param.tcp_client_received_data.length = (uint32_t)length;
 
-            uint8_t * p_data;
+			uint8_t* p_data;
 
-            /* Data starts after the 4th comma */
-            p_data = (uint8_t *)rm_da16600_findnchr((char *)p_buf, ',', 4);
-            p_data = p_data + 1;
+			/* Data starts after the 4th comma */
+			p_data = (uint8_t*)rm_da16600_findnchr((char*)p_buf, ',', 4);
+			p_data = p_data + 1;
 
-            /* Determine how much data (out of the total) was received */
-            g_rx_data_len = (uint32_t)strlen((const char *)p_buf) - ((uint32_t)(p_data - p_buf));
+			/* Determine how much data (out of the total) was received */
+			g_rx_data_len = (uint32_t)strlen((const char*)p_buf) - ((uint32_t)(p_data - p_buf));
 
-            memcpy(g_rm16600_callback_args.param.tcp_client_received_data.data, p_data, g_rx_data_len);
+			memcpy(g_rm16600_callback_args.param.tcp_client_received_data.data, p_data, g_rx_data_len);
 
-            g_rm16600_callback_args.event = DA16600_EVENT_TCP_CLIENT_DATA_RECEIVED;
+			g_rm16600_callback_args.event = DA16600_EVENT_TCP_CLIENT_DATA_RECEIVED;
 
-            if (g_rx_data_len >= g_rm16600_callback_args.param.tcp_client_received_data.length)
-            {
-                /* NULL terminate so data can be handled by string processing functions */
-                g_rm16600_callback_args.param.tcp_client_received_data.data[g_rx_data_len] = '\0';
-                p_instance_ctrl->p_callback(&g_rm16600_callback_args);
-                g_rx_data_in_progress = false;
-            }
-            else
-            {
-                /* More data to be received... */
-                g_rx_data_in_progress = true;
-            }
-        }
-        else
-        {
-            FSP_ASSERT(sizeof(g_rm16600_callback_args.param.tcp_client_received_data.data) >=
-                       g_rm16600_callback_args.param.tcp_client_received_data.length);
-        }
-    }
+			if (g_rx_data_len >= g_rm16600_callback_args.param.tcp_client_received_data.length) {
+				/* NULL terminate so data can be handled by string processing functions */
+				g_rm16600_callback_args.param.tcp_client_received_data.data[g_rx_data_len] = '\0';
+				p_instance_ctrl->p_callback(&g_rm16600_callback_args);
+				g_rx_data_in_progress = false;
+			} else {
+				/* More data to be received... */
+				g_rx_data_in_progress = true;
+			}
+		} else {
+			FSP_ASSERT(sizeof(g_rm16600_callback_args.param.tcp_client_received_data.data) >= g_rm16600_callback_args.param.tcp_client_received_data.length);
+		}
+	}
 }
 
+static void rm_da16600_handle_nwmqcl(uint8_t* p_buf) {
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+
+#if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
+    FSP_ASSERT(NULL != p_instance_ctrl->p_callback);
+#endif
+
+	int status;
+	if (sscanf((const char*)p_buf, "+NWMQCL:%d", &status) == 1) {
+		if (status == 1) {
+			g_rm16600_callback_args.event = DA16600_EVENT_MQTT_CONNECTED;
+		} else {
+			g_rm16600_callback_args.event = DA16600_EVENT_MQTT_DISCONNECTED;
+		}
+		p_instance_ctrl->p_callback(&g_rm16600_callback_args);
+	}
+}
 
 /**********************************************************************************************************************
  *  Compare string (s) to ok response.
@@ -1267,16 +1082,12 @@ static void rm_da16600_handle_trdts(uint8_t * p_buf)
  *
  *  @retval true if string matches ok response, otherwise false.
  **********************************************************************************************************************/
-static bool rm_da16600_is_str_ok(const char * s)
-{
-    bool ret = false;
-    if (0 == strncmp((const char *) s,
-                     (const char *) g_da16600_return_text_ok,
-              strlen((const char *) g_da16600_return_text_ok)))
-    {
-        ret = true;
-    }
-    return ret;
+static bool rm_da16600_is_str_ok(const char* s) {
+	bool ret = false;
+	if (0 == strncmp((const char*)s, (const char*)g_da16600_return_text_ok, strlen((const char*)g_da16600_return_text_ok))) {
+		ret = true;
+	}
+	return ret;
 }
 
 /**********************************************************************************************************************
@@ -1286,16 +1097,12 @@ static bool rm_da16600_is_str_ok(const char * s)
  *
  *  @retval true if string matches error response, otherwise false.
  **********************************************************************************************************************/
-static bool rm_da16600_is_str_err(const char * s)
-{
-    bool ret = false;
-    if (0 == strncmp((const char *) s,
-                     (const char *) g_da16600_return_text_error,
-              strlen((const char *) g_da16600_return_text_error)))
-    {
-        ret = true;
-    }
-    return ret;
+static bool rm_da16600_is_str_err(const char* s) {
+	bool ret = false;
+	if (0 == strncmp((const char*)s, (const char*)g_da16600_return_text_error, strlen((const char*)g_da16600_return_text_error))) {
+		ret = true;
+	}
+	return ret;
 }
 
 /**********************************************************************************************************************
@@ -1305,16 +1112,12 @@ static bool rm_da16600_is_str_err(const char * s)
  *
  *  @retval true if string matches expected response, otherwise false.
  **********************************************************************************************************************/
-static bool rm_da16600_is_str_rsp(const char * s)
-{
-    bool ret = false;
-    if (0 == strncmp((const char *) s,
-                     (const char *) g_da16600_cmd_in_progress,
-              strlen((const char *) g_da16600_cmd_in_progress)))
-    {
-        ret = true;
-    }
-    return ret;
+static bool rm_da16600_is_str_rsp(const char* s) {
+	bool ret = false;
+	if (0 == strncmp((const char*)s, (const char*)g_da16600_cmd_in_progress, strlen((const char*)g_da16600_cmd_in_progress))) {
+		ret = true;
+	}
+	return ret;
 }
 
 /**********************************************************************************************************************
@@ -1326,21 +1129,237 @@ static bool rm_da16600_is_str_rsp(const char * s)
  *
  *  @retval Pointer to position of nth occurrence of character or NULL if not found.
  **********************************************************************************************************************/
-static char * rm_da16600_findnchr(const char *str, char chr, int occ)
-{
-    int matches = 0;
-    char *location = NULL;
+static char* rm_da16600_findnchr(const char* str, char chr, int occ) {
+	int matches = 0;
+	char* location = NULL;
 
-    for (int i = 0; str[i] != '\0'; i++)
-    {
-        if (str[i] == chr)
-        {
-            if (++matches == occ)
-            {
-                location = (char *)&str[i];
-                break;
-            }
-        }
-    }
-    return location;
+	for (int i = 0; str[i] != '\0'; i++) {
+		if (str[i] == chr) {
+			if (++matches == occ) {
+				location = (char*)&str[i];
+				break;
+			}
+		}
+	}
+	return location;
+}
+
+da16600_err_t rm_da16600_open_aziothub_mqtt_client(char* iotHubHostname, char* deviceName, char* sasToken) {
+	da16600_err_t err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+	uint8_t cmd_buf[1024];
+	int written;
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQBR=%s,%d\r\n", iotHubHostname, 8883);
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	if (err) {
+		return err;
+	}
+
+	/*
+	 written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQTS=XXX,YYY,ZZZ,AAA,BBB,...\r\n", hostname, port);
+	 if ((written < 0) || (written >= sizeof(cmd_buf))) {
+	 return DA16600_INVALID_PARAM;
+	 }
+
+	 err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	 if (err) {
+	 return err;
+	 }
+	 */
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQTP=devices/%s/messages/events/\r\n", deviceName);
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	if (err) {
+		return err;
+	}
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQCID=%s\r\n", deviceName);
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	if (err) {
+		return err;
+	}
+
+	//
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQLI=%s/%s/?api-version=2021-04-12,%s\r\n", iotHubHostname, deviceName, sasToken);
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	if (err) {
+		return err;
+	}
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQPING=300\r\n");
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	if (err) {
+		return err;
+	}
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQTLS=1\r\n");
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	if (err) {
+		return err;
+	}
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQAUTO=1\r\n");
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	if (err) {
+		return err;
+	}
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQSNI=%s\r\n", iotHubHostname);
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	if (err) {
+		return err;
+	}
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQCL=1\r\n");
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_500MS);
+	if (err) {
+		return err;
+	}
+
+	return DA16600_SUCCESS;
+}
+
+da16600_err_t rm_da16600_open_aziothub_mqtt_publish(char* message) {
+	da16600_err_t err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+	uint8_t cmd_buf[1024];
+	int written;
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWMQMSG=%s\r\n", message);
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	err = rm_da16600_send_write_cmd(p_instance_ctrl, cmd_buf, DA16600_TIMEOUT_5SEC);
+	if (err) {
+		return err;
+	}
+	return DA16600_SUCCESS;
+}
+
+da16600_err_t rm_da16600_http_client_post(char* url, char* data) {
+	fsp_err_t fsp_err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+	uint8_t cmd_buf[1024];
+	int written;
+
+	written = snprintf((char*)cmd_buf, sizeof(cmd_buf), "AT+NWHTC=%s,post,'%s'\r\n", url, data);
+	if ((written == 0) || (written >= (int)sizeof(cmd_buf))) {
+		return DA16600_INVALID_PARAM;
+	}
+
+	fsp_err = p_instance_ctrl->uart_instance->p_api->write(p_instance_ctrl->uart_instance->p_ctrl, (uint8_t*)cmd_buf, (uint32_t)strlen((char*)cmd_buf));
+	if (fsp_err) {
+		return DA16600_UART_ERROR;
+	}
+
+	uint16_t tx_time = rm_time_now_ms();
+
+	int isResponseProcessed = 0;
+
+	uint8_t lineBuffer[256];
+	uint8_t* lineBufferWr = lineBuffer;
+	uint8_t* lineBufferEnd = lineBuffer + sizeof(lineBuffer);
+
+	do {
+
+		uint8_t ch;
+		if (true == rm_circ_buf_get(&rx_circ_buf, &ch)) {
+			*lineBufferWr = ch;
+
+			if (lineBufferWr - lineBuffer >= 1) {
+				if (*(lineBufferWr) == '\n' && *(lineBufferWr - 1) == '\r') {
+					*(lineBufferWr - 1) = 0;
+
+					if (lineBufferWr - lineBuffer >= 2) {
+						if (isResponseProcessed == 0) {
+							int isOk = strcmp((char*)lineBuffer, "OK") == 0;
+							if (!isOk) {
+								return DA16600_RESPONSE_INVALID;
+							}
+							isResponseProcessed = 1;
+						}
+
+						int isTermination = memcmp("+NWHTCSTATUS:", lineBuffer, strlen("+NWHTCSTATUS:")) == 0;
+
+						if (isTermination) {
+							return DA16600_SUCCESS;
+						}
+					}
+
+					lineBufferWr = lineBuffer;
+					continue;
+				}
+			}
+
+			lineBufferWr++;
+			if (lineBufferWr == lineBufferEnd) {
+				lineBufferWr = lineBuffer;
+			}
+		}
+	} while (1);
+
+	return DA16600_SUCCESS;
+}
+
+da16600_err_t rm_da16600_get_time(char* timeBuffer, size_t timeBufferSize) {
+	da16600_err_t err;
+	da16600_instance_ctrl_t* p_instance_ctrl = &g_rm_da16600_instance;
+
+#if (DA16600_CFG_PARAM_CHECKING_ENABLED == 1)
+    FSP_ERROR_RETURN(DA16600_OPEN == p_instance_ctrl->open, FSP_ERR_NOT_OPEN);
+#endif
+
+	uint8_t* p_rsp_buf;
+	err = rm_da16600_send_read_cmd(p_instance_ctrl, (uint8_t*)"AT+TIME=?\r\n", DA16600_TIMEOUT_1SEC, &p_rsp_buf);
+	if (err) {
+		bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buf);
+		FSP_ASSERT(true == freed);
+		return DA16600_RESPONSE_INVALID;
+	}
+
+	strncpy(timeBuffer, p_rsp_buf, timeBufferSize);
+	timeBuffer[timeBufferSize - 1] = '\0';
+
+	bool freed = rm_fifo_put(&p_instance_ctrl->buf_queue, &p_rsp_buf);
+	FSP_ASSERT(true == freed);
+
+	return DA16600_SUCCESS;
 }

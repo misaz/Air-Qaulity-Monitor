@@ -27,6 +27,7 @@
 #include "r_timer_api.h"
 #include "rm_time.h"
 #include "hal_data.h"
+#include "da16600_thrd.h"
 
 /***********************************************************************************************************************
  * Macro definitions

@@ -1,6 +1,7 @@
 collapse/module.driver.comms_i2c_on_comms_i2c_bus.1172406607=false
 collapse/module.driver.comms_i2c_on_comms_i2c_device.1018610061=false
 collapse/module.driver.i2c_on_iic_master.21984232=false
+collapse/module.driver.uart_on_sci_uart.1708991009=false
 collapse/module.driver.zmod4510_oaq_2nd_on_zmod4xxx.576568214=false
 collapse/module.driver.zmod4xxx_on_zmod4xxx.1766636719=false
 eclipse.preferences.version=1
